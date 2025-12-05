@@ -628,7 +628,7 @@ void simulate(CPU &cpu, const string &outputFile)
                 if (!hit) {
                     if (cur.memCyclesRemaining <= 0) {
                         if (cpu.cycle >= cpu.cacheBusyUntil) {
-                            //cpu.iCache.accessCount++;
+                            cpu.iCache.hitCount++;
 
                             cur.memCyclesRemaining = CACHE_LATENCY;
                             cpu.cacheBusyUntil = cpu.cycle + CACHE_LATENCY;
@@ -647,9 +647,9 @@ void simulate(CPU &cpu, const string &outputFile)
                         }
                     }
                 }
-                else {
-                    cpu.iCache.hitCount++;
-                }
+                //else {
+                    //cpu.iCache.hitCount++;
+                //}
 
                 if (stay || next[ID_IDX].valid) {
                     next[IF_IDX] = cur;
@@ -721,7 +721,7 @@ void simulate(CPU &cpu, const string &outputFile)
 
     fout << "Total number of access requests for instruction cache: "
          << cpu.iCache.accessCount << "\n";
-    fout << "Number of instruction cache hits: " << cpu.iCache.hitCount << "\n";
+    fout << "Number of instruction cache hits: " << cpu.iCache.accessCount - cpu.iCache.hitCount << "\n";
     fout << "Total number of access requests for data cache: "
          << cpu.dCache.accessCount << "\n";
     fout << "Number of data cache hits: " << cpu.dCache.hitCount << "\n";
