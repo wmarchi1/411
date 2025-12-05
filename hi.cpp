@@ -1,9 +1,14 @@
+// ===============================================================
+//  PIECE 1 — Headers, Enums, CPU Structures, Helper Functions
+// ===============================================================
+
 #include <iostream>
 #include <iomanip>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "parseInput.hpp"   // must provide: Opcode, Instruction, parseInstFile, parseDataFile
 
@@ -29,12 +34,11 @@ enum class Stage {
 // Timeline for each instruction
 // ============================
 struct InstructionTimeline {
-    // cycle when the instruction LEAVES each stage
     int cycle[static_cast<int>(Stage::NUM_STAGES)] = {0};
 };
 
 // ============================
-// Very simple cache stubs
+// Cache statistics structs
 // ============================
 struct ICache {
     int accessCount = 0;
@@ -47,14 +51,12 @@ struct DCache {
 };
 
 // ============================
-// Pipeline latch between stages
+// Pipeline latch
 // ============================
 struct PipelineLatch {
     bool valid = false;
-    int  instrIndex = -1;       // index into program vector
-
-    // For MEM stage: dummy stall counter for LW/SW
-    int  memCyclesRemaining = 0;
+    int instrIndex = -1;
+    int memCyclesRemaining = 0;  // used for I-cache and D-cache miss stalls
 };
 
 // ============================
@@ -62,54 +64,59 @@ struct PipelineLatch {
 // ============================
 struct CPU {
     uint32_t regs[32] = {0};
-
-    // word-addressed memory
     vector<uint32_t> memory;
 
-    // program and label map (filled by parser)
     vector<Instruction> program;
     unordered_map<string,int> labelToIndex;
 
-    // caches (stubs for now)
     ICache iCache;
     DCache dCache;
 
-    // pipeline latches
     PipelineLatch stage[static_cast<int>(Stage::NUM_STAGES)];
-
-    // per-instruction timelines
     vector<InstructionTimeline> timelines;
 
-    bool haltFetched = false;   // true after HLT passes ID
-    bool done        = false;
+    bool haltFetched = false;
 
     int cycle = 0;
-    // NEW: shared cache resource (I-cache + D-cache)
-    int cacheBusyUntil = 0; // cycle when the cache port becomes free
+
+    // Shared cache port:
+    int cacheBusyUntil = 0;
+
+    // Which instruction blocks (pc indices) are cached
     unordered_set<int> icacheBlocks;
+
+    // Used for taken branches — IF must fetch from new PC next cycle
+    int programCounterOverride = -1;
 };
 
+// ===============================================================
+// CACHE HELPERS
+// ===============================================================
+
+inline int icacheBlockStart(int pc) {
+    return (pc / 4) * 4;
+}
+
 bool inICache(const CPU &cpu, int pc) {
-    int blockStart = (pc / 4) * 4;
-    return cpu.icacheBlocks.count(blockStart) > 0;
+    return cpu.icacheBlocks.count(icacheBlockStart(pc)) > 0;
 }
 
 void loadICacheBlock(CPU &cpu, int pc) {
-    int blockStart = (pc / 4) * 4;
-    cpu.icacheBlocks.insert(blockStart);
+    int blk = icacheBlockStart(pc);
+    cpu.icacheBlocks.insert(blk);
 }
 
-// ============================
-// Helper: check if all pipeline stages are empty
-// ============================
+// ===============================================================
+// GENERAL HELPERS
+// ===============================================================
+
 bool pipelineEmpty(const CPU &cpu) {
-    for (int s = 0; s < static_cast<int>(Stage::NUM_STAGES); ++s) {
+    for (int s = 0; s < (int)Stage::NUM_STAGES; ++s) {
         if (cpu.stage[s].valid) return false;
     }
     return true;
 }
 
-// Return TRUE if this instruction writes to a register, and set destReg to that register number.
 bool writesToReg(const Instruction &inst, int &destReg) {
     destReg = -1;
     switch (inst.op) {
@@ -124,21 +131,17 @@ bool writesToReg(const Instruction &inst, int &destReg) {
         case Opcode::MULTI:
         case Opcode::DIV_:
         case Opcode::REM_:
-        case Opcode::LW:   // load writes to rd
+        case Opcode::LW:
             destReg = inst.rd;
-            return (destReg >= 0);
+            return destReg >= 0;
         default:
-            // SW, BEQ, BNE, J, HLT do not write a destination register
             return false;
     }
 }
 
-// Collect all source registers that this instruction READS.
 vector<int> getSourceRegs(const Instruction &inst) {
-    vector<int> srcs;
-    auto add = [&](int r) {
-        if (r >= 0) srcs.push_back(r);
-    };
+    vector<int> src;
+    auto add = [&](int r){ if (r >= 0) src.push_back(r); };
 
     switch (inst.op) {
         case Opcode::ADD:
@@ -159,14 +162,12 @@ vector<int> getSourceRegs(const Instruction &inst) {
             break;
 
         case Opcode::LW:
-            // LW Rdest, offset(Rbase) -> reads base register
             add(inst.rs);
             break;
 
         case Opcode::SW:
-            // SW Rsrc, offset(Rbase) -> reads base and source
-            add(inst.rs); // base
-            add(inst.rd); // value to store (we used rd in parser)
+            add(inst.rs);
+            add(inst.rd);
             break;
 
         case Opcode::BEQ:
@@ -175,376 +176,526 @@ vector<int> getSourceRegs(const Instruction &inst) {
             add(inst.rt);
             break;
 
-        // LI, J, HLT: no true data dependencies in this model
         default:
             break;
     }
-
-    return srcs;
+    return src;
 }
 
-// Stage index (Stage::IF, ID, EX1, ...) at which this instruction's
-// destination register value is first available for forwarding.
+// When the producer’s value is first forwardable:
 int getReadyStage(const Instruction &inst) {
     switch (inst.op) {
-        // These don't write regs, but if they did, they'd be ready in ID.
         case Opcode::J:
         case Opcode::BEQ:
         case Opcode::BNE:
-            return static_cast<int>(Stage::ID);
+            return (int)Stage::ID;
 
-        // LI: ready after EX1
         case Opcode::LI:
-            return static_cast<int>(Stage::EX1);
-
-        // AND / OR / SW: ALU result is ready after EX1
         case Opcode::AND_:
         case Opcode::OR_:
         case Opcode::SW:
-            return static_cast<int>(Stage::EX1);
+            return (int)Stage::EX1;
 
-        // LW: loaded data is available only in MEM (then forwarded)
         case Opcode::LW:
-            return static_cast<int>(Stage::MEM);
+            return (int)Stage::MEM;
 
-        // ADD-family: 2-cycle EX ⇒ result ready after EX2
         case Opcode::ADD:
         case Opcode::ADDI:
         case Opcode::SUB:
         case Opcode::SUBI:
-            return static_cast<int>(Stage::EX2);
+            return (int)Stage::EX2;
 
-        // MULT-family: 4-cycle EX ⇒ result ready after EX4
         case Opcode::MULT:
         case Opcode::MULTI:
-            return static_cast<int>(Stage::EX4);
+            return (int)Stage::EX4;
 
-        // DIV / REM: 5-cycle EX ⇒ result ready after EX5
         case Opcode::DIV_:
         case Opcode::REM_:
-            return static_cast<int>(Stage::EX5);
+            return (int)Stage::EX5;
 
         default:
-            // Safe fallback
-            return static_cast<int>(Stage::MEM);
+            return (int)Stage::MEM;
     }
 }
 
-// ============================
-// Pipeline simulation
-//  - instructions flow through pipeline
-//  - MEM stubs: LW/SW just "stall" for fixed latency
-// ============================
-void simulate(CPU &cpu, const string &outputFile) {
-    //const int DUMMY_MEM_LATENCY = 1;  // # of cycles LW/SW spend stalling in MEM
-    const int CACHE_LATENCY = 9;
+// ===============================================================
+//  PIECE 2 — Cache Logic + IF Stage + MEM Stage
+// ===============================================================
+
+const int CACHE_MISS_LATENCY = 12;
+
+// Handles D-cache access for LW / SW
+void handleMemStage(CPU &cpu, PipelineLatch &cur, PipelineLatch next[], int MEM_IDX, int WB_IDX) {
+    int idx = cur.instrIndex;
+    Instruction &inst = cpu.program[idx];
+
+    bool isLoad  = (inst.op == Opcode::LW);
+    bool isStore = (inst.op == Opcode::SW);
+
+    if (isLoad) {
+        // LW CAN MISS → 12-cycle stall
+        bool stillWaiting = false;
+
+        // Start miss if not started
+        if (cur.memCyclesRemaining <= 0) {
+            if (cpu.cycle >= cpu.cacheBusyUntil) {
+                cpu.dCache.accessCount++;
+                // LW may miss → always treat as miss for simplicity
+                cur.memCyclesRemaining = CACHE_MISS_LATENCY;
+                cpu.cacheBusyUntil = cpu.cycle + CACHE_MISS_LATENCY;
+            } else {
+                stillWaiting = true;
+            }
+        }
+
+        // Continue miss countdown
+        if (!stillWaiting && cur.memCyclesRemaining > 0) {
+            cur.memCyclesRemaining--;
+            if (cur.memCyclesRemaining > 0)
+                stillWaiting = true;
+        }
+
+        // Stall if not done
+        if (stillWaiting) {
+            next[MEM_IDX] = cur;
+            return;
+        }
+
+        // Miss finished → MEM → WB
+        if (!next[WB_IDX].valid) {
+            cpu.timelines[idx].cycle[MEM_IDX] = cpu.cycle;
+            next[WB_IDX] = cur;
+        } else {
+            next[MEM_IDX] = cur;
+        }
+    }
+    else if (isStore) {
+        // SW NEVER MISSES — but still occupies D-cache for ordering, 1 cycle.
+
+        if (cur.memCyclesRemaining <= 0) {
+            if (cpu.cycle >= cpu.cacheBusyUntil) {
+                cpu.dCache.accessCount++;
+                cpu.dCache.hitCount++;     // always hit for SW
+                cur.memCyclesRemaining = 1; // store takes 1 cycle
+                cpu.cacheBusyUntil = cpu.cycle + 1;
+            } else {
+                next[MEM_IDX] = cur;
+                return;
+            }
+        }
+
+        cur.memCyclesRemaining--;
+        if (cur.memCyclesRemaining > 0) {
+            next[MEM_IDX] = cur;
+            return;
+        }
+
+        if (!next[WB_IDX].valid) {
+            cpu.timelines[idx].cycle[MEM_IDX] = cpu.cycle;
+            next[WB_IDX] = cur;
+        } else {
+            next[MEM_IDX] = cur;
+        }
+    }
+    else {
+        // Not LW/SW → regular 1-cycle MEM
+        if (!next[WB_IDX].valid) {
+            cpu.timelines[idx].cycle[MEM_IDX] = cpu.cycle;
+            next[WB_IDX] = cur;
+        } else {
+            next[MEM_IDX] = cur;
+        }
+    }
+}
+
+
+// ===============================================================
+// IF Stage — WITH 12-cycle miss + load 4 instructions
+// ===============================================================
+void handleIFStage(CPU &cpu, PipelineLatch &cur, PipelineLatch next[],
+                   int IF_IDX, int ID_IDX)
+{
+    if (!cur.valid) return;
+
+    int idx = cur.instrIndex;
+
+    bool hit = inICache(cpu, idx);
+    bool stay = false;
+
+    if (!hit) {
+        // MISS → must load 4 instructions into cache
+        if (cur.memCyclesRemaining <= 0) {
+            if (cpu.cycle >= cpu.cacheBusyUntil) {
+                cpu.iCache.accessCount++;
+                cur.memCyclesRemaining = CACHE_MISS_LATENCY;
+                cpu.cacheBusyUntil = cpu.cycle + CACHE_MISS_LATENCY;
+            } else {
+                stay = true;
+            }
+        }
+
+        if (!stay && cur.memCyclesRemaining > 0) {
+            cur.memCyclesRemaining--;
+            if (cur.memCyclesRemaining > 0)
+                stay = true;
+            else {
+                // MISS FINISHED → load 4-inst block
+                int base = (idx / 4) * 4;
+                cpu.icacheBlocks.insert(base);
+                cpu.icacheBlocks.insert(base + 1);
+                cpu.icacheBlocks.insert(base + 2);
+                cpu.icacheBlocks.insert(base + 3);
+                cpu.iCache.hitCount++;  // After miss, next are hits
+            }
+        }
+    }
+
+    // Cannot move to ID if ID is occupied
+    if (stay || next[ID_IDX].valid) {
+        next[IF_IDX] = cur;
+        return;
+    }
+
+    // Otherwise IF → ID
+    cpu.timelines[idx].cycle[IF_IDX] = cpu.cycle;
+    next[ID_IDX] = cur;
+}
+
+
+// ===============================================================
+//  PIECE 3 — ID Stage, Hazards, Branch Resolution, EX Pipeline
+// ===============================================================
+
+// Returns TRUE if inst writes a register AND sets destReg.
+bool writesToReg(const Instruction &inst, int &destReg);
+
+// Returns all registers read by inst.
+vector<int> getSourceRegs(const Instruction &inst);
+
+// Returns the pipeline stage at which this instruction’s result is ready.
+int getReadyStage(const Instruction &inst);
+
+
+// ---------------------------------------------------------------
+//  Hazard Detection Helper
+// ---------------------------------------------------------------
+bool hasRAWDependency(const CPU &cpu, int instIndex, const vector<int> &srcs,
+                      int ID_IDX)
+{
+    const int STAGES = static_cast<int>(Stage::NUM_STAGES);
+
+    for (int s = 0; s < STAGES; s++) {
+        if (s == ID_IDX) continue;
+
+        const PipelineLatch &other = cpu.stage[s];
+        if (!other.valid) continue;
+
+        int olderIdx = other.instrIndex;
+        if (olderIdx >= instIndex) continue;  // Only older insts matter
+
+        const Instruction &producer = cpu.program[olderIdx];
+
+        int destReg = -1;
+        if (!writesToReg(producer, destReg)) continue;
+
+        int readyStage = getReadyStage(producer);
+
+        // The producer's pipeline stage
+        if (s < readyStage) {
+            // Value not ready yet → check if inst reads this reg
+            for (int r : srcs) {
+                if (r == destReg) return true;
+            }
+        }
+    }
+    return false;
+}
+
+
+// ---------------------------------------------------------------
+//  ID Stage Handler (HLT, branches, hazards, moves to EX1)
+// ---------------------------------------------------------------
+void handleIDStage(CPU &cpu, PipelineLatch &cur, PipelineLatch next[],
+                   int ID_IDX, int EX1_IDX)
+{
+    if (!cur.valid) return;
+
+    int idx = cur.instrIndex;
+    Instruction &inst = cpu.program[idx];
+
+    vector<int> srcs = getSourceRegs(inst);
+    bool hazard = hasRAWDependency(cpu, idx, srcs, ID_IDX);
+
+    // ------------------- HLT -------------------
+    if (inst.op == Opcode::HLT) {
+        if (hazard) {
+            next[ID_IDX] = cur;   // stall until safe
+            return;
+        }
+
+        cpu.timelines[idx].cycle[ID_IDX] = cpu.cycle;
+        cpu.haltFetched = true;   // stop future fetches
+        return;                   // retire here; do NOT enter EX
+    }
+
+    // ------------------- Branches -------------------
+    if (inst.op == Opcode::J || inst.op == Opcode::BEQ || inst.op == Opcode::BNE) {
+
+        if (hazard) {
+            next[ID_IDX] = cur;  // Need operands available before resolving
+            return;
+        }
+
+        // Resolve branch now
+        cpu.timelines[idx].cycle[ID_IDX] = cpu.cycle;
+
+        bool taken = false;
+        if (inst.op == Opcode::J) taken = true;
+        else {
+            int rs = cpu.regs[inst.rs];
+            int rt = cpu.regs[inst.rt];
+            if (inst.op == Opcode::BEQ) taken = (rs == rt);
+            if (inst.op == Opcode::BNE) taken = (rs != rt);
+        }
+
+        if (taken) {
+            int newPC = cpu.labelToIndex[inst.label];
+            cpu.stage[(int)Stage::IF].valid = false;   // flush IF
+            cpu.stage[(int)Stage::IF].instrIndex = -1;
+            // PC will be updated in simulate() when fetch runs
+            cpu.programCounterOverride = newPC;
+        }
+
+        return;  // branches never go into EX
+    }
+
+    // ------------------- Normal instructions → EX1 -------------------
+    bool ex1Free = (!next[EX1_IDX].valid);
+
+    if (!hazard && ex1Free) {
+        cpu.timelines[idx].cycle[ID_IDX] = cpu.cycle;
+        next[EX1_IDX] = cur;
+    }
+    else {
+        next[ID_IDX] = cur;  // Stall
+    }
+}
+
+
+// ---------------------------------------------------------------
+//  EX Pipeline Handler (EX1 → EX5)
+// ---------------------------------------------------------------
+void handleEXStages(CPU &cpu, PipelineLatch next[],
+                    int EX1_IDX, int EX5_IDX)
+{
+    for (int s = EX5_IDX; s >= EX1_IDX; s--) {
+        PipelineLatch &cur = cpu.stage[s];
+        if (!cur.valid) continue;
+
+        int idx = cur.instrIndex;
+
+        int nextStage = s + 1;
+        if (nextStage < (int)Stage::NUM_STAGES &&
+            !next[nextStage].valid)
+        {
+            cpu.timelines[idx].cycle[s] = cpu.cycle;
+            next[nextStage] = cur;
+        }
+        else {
+            next[s] = cur; // stall in stage
+        }
+    }
+}
+
+
+// ===============================================================
+//  PIECE 4 — Full simulate() and Output Writer
+// ===============================================================
+
+void simulate(CPU &cpu, const string &outputFile)
+{
+    const int CACHE_LATENCY = 12;     // 12-cycle miss stall
+    const int STAGES        = static_cast<int>(Stage::NUM_STAGES);
+    const int IF_IDX        = static_cast<int>(Stage::IF);
+    const int ID_IDX        = static_cast<int>(Stage::ID);
+    const int EX1_IDX       = static_cast<int>(Stage::EX1);
+    const int EX5_IDX       = static_cast<int>(Stage::EX5);
+    const int MEM_IDX       = static_cast<int>(Stage::MEM);
+    const int WB_IDX        = static_cast<int>(Stage::WB);
 
     cpu.cycle = 0;
-    cpu.done  = false;
+    cpu.haltFetched = false;
+    cpu.cacheBusyUntil = 0;
 
-    const int STAGES  = static_cast<int>(Stage::NUM_STAGES);
-    const int IF_IDX  = static_cast<int>(Stage::IF);
-    const int ID_IDX  = static_cast<int>(Stage::ID);
-    const int EX1_IDX = static_cast<int>(Stage::EX1);
-    const int EX5_IDX = static_cast<int>(Stage::EX5);
-    const int MEM_IDX = static_cast<int>(Stage::MEM);
-    const int WB_IDX  = static_cast<int>(Stage::WB);
-
-    // PC is index into cpu.program
     int pc = 0;
-    const int N = static_cast<int>(cpu.program.size());
+    int N = (int)cpu.program.size();
+    cpu.programCounterOverride = -1;
 
-    // main simulation loop
     while (true) {
         cpu.cycle++;
 
-        // next-cycle latches
         PipelineLatch next[STAGES];
-        for (int s = 0; s < STAGES; ++s) {
-            next[s] = PipelineLatch{};
-        }
+        for (int s = 0; s < STAGES; s++) next[s] = PipelineLatch{};
 
-        // -------------------------
-        // 1) WB stage
-        // -------------------------
+        // ---------------- WB ----------------
         {
-            PipelineLatch &cur = cpu.stage[WB_IDX];
+            auto &cur = cpu.stage[WB_IDX];
             if (cur.valid) {
                 int idx = cur.instrIndex;
-                // mark time leaving WB
                 cpu.timelines[idx].cycle[WB_IDX] = cpu.cycle;
-                // retired
             }
         }
 
-        // -------------------------
-// 2) MEM stage (D-cache for LW/SW, 9 cycles, shared with I-cache)
-// -------------------------
-{
-    PipelineLatch &cur = cpu.stage[MEM_IDX];
-    if (cur.valid) {
-        int idx = cur.instrIndex;
-        Instruction &inst = cpu.program[idx];
-
-        bool isLoadStore = (inst.op == Opcode::LW || inst.op == Opcode::SW);
-
-        if (isLoadStore) {
-            bool stayInMEM = false;
-
-            // If we haven't started a D-cache access yet
-            if (cur.memCyclesRemaining <= 0) {
-                // Try to start a D-cache access (shared port)
-                if (cpu.cycle >= cpu.cacheBusyUntil) {
-                    cpu.dCache.accessCount++;
-                    cpu.dCache.hitCount++;  // assume all hits
-
-                    cur.memCyclesRemaining = CACHE_LATENCY;
-                    cpu.cacheBusyUntil     = cpu.cycle + CACHE_LATENCY;
-                } else {
-                    // Cache port busy (I-cache or other D-cache access)
-                    stayInMEM = true;
-                }
-            }
-
-            if (!stayInMEM && cur.memCyclesRemaining > 0) {
-                // Access in progress
-                cur.memCyclesRemaining--;
-
-                if (cur.memCyclesRemaining > 0) {
-                    // Still waiting on D-cache
-                    stayInMEM = true;
-                }
-            }
-
-            if (stayInMEM) {
-                next[MEM_IDX] = cur;
-            } else {
-                // D-cache access done, try to move MEM -> WB
-                if (!next[WB_IDX].valid) {
-                    cpu.timelines[idx].cycle[MEM_IDX] = cpu.cycle;
-                    cur.memCyclesRemaining = 0;
-                    next[WB_IDX] = cur;
-                } else {
-                    // WB busy, remain in MEM
-                    next[MEM_IDX] = cur;
-                }
-            }
-        } else {
-            // Non-memory instruction: simple 1-cycle MEM
-            if (!next[WB_IDX].valid) {
-                cpu.timelines[idx].cycle[MEM_IDX] = cpu.cycle;
-                next[WB_IDX] = cur;
-            } else {
-                next[MEM_IDX] = cur;
-            }
-        }
-    }
-}
-
-        // -------------------------
-        // 3) EX5..EX1 (backwards, everyone flows EX1→EX5)
-// -------------------------
+        // ---------------- MEM (D-cache) ----------------
         {
-            for (int s = EX5_IDX; s >= EX1_IDX; --s) {
-                PipelineLatch &cur = cpu.stage[s];
-                if (!cur.valid) continue;
-
-                int idx       = cur.instrIndex;
-                int nextStage = s + 1;
-
-                if (nextStage < STAGES && !next[nextStage].valid) {
-                    cpu.timelines[idx].cycle[s] = cpu.cycle;
-                    next[nextStage] = cur;
-                } else {
-                    // blocked: stay here
-                    next[s] = cur;
-                }
-            }
-        }
-
-        // -------------------------
-        // 4) ID stage (HLT + branches retire here, others go to EX1)
-// -------------------------
-        {
-            PipelineLatch &cur = cpu.stage[ID_IDX];
+            auto &cur = cpu.stage[MEM_IDX];
             if (cur.valid) {
+
                 int idx = cur.instrIndex;
                 Instruction &inst = cpu.program[idx];
 
-                // 1) Collect source registers (works for normal ops AND BEQ/BNE)
-                vector<int> srcs = getSourceRegs(inst);
-                bool hasHazard   = false;
+                bool isLoadStore =
+                    (inst.op == Opcode::LW || inst.op == Opcode::SW);
 
-                // 2) Scan all pipeline stages for older writers that conflict
-                for (int s = 0; s < STAGES && !hasHazard; ++s) {
-                    if (s == ID_IDX) continue;  // skip self
+                if (isLoadStore) {
+                    bool stay = false;
 
-                    PipelineLatch &otherLatch = cpu.stage[s];
-                    if (!otherLatch.valid) continue;
+                    if (inst.op == Opcode::LW) {
+                        // LW *can miss* — must start D-cache access
+                        if (cur.memCyclesRemaining <= 0) {
+                            if (cpu.cycle >= cpu.cacheBusyUntil) {
+                                cpu.dCache.accessCount++;
+                                cpu.dCache.hitCount++; // simulator assumes hits
 
-                    int otherIdx = otherLatch.instrIndex;
-                    if (otherIdx >= idx) continue;  // only older instructions can cause RAW hazards
-
-                    Instruction &producer = cpu.program[otherIdx];
-
-                    int destReg = -1;
-                    if (!writesToReg(producer, destReg)) continue; // no write → no RAW
-
-                    // At which stage is this producer's value first available?
-                    int readyStage    = getReadyStage(producer);
-                    int producerStage = s;
-
-                    bool producerReady = (producerStage >= readyStage);
-
-                    if (!producerReady) {
-                        // Check if this destReg is one of our sources
-                        for (int src : srcs) {
-                            if (src == destReg) {
-                                hasHazard = true;
-                                break;
+                                cur.memCyclesRemaining = CACHE_LATENCY;
+                                cpu.cacheBusyUntil = cpu.cycle + CACHE_LATENCY;
+                            } else {
+                                stay = true;
                             }
                         }
                     }
-                }
 
-                // -------- Special case: HLT --------
-                if (inst.op == Opcode::HLT) {
-                    // HLT doesn’t read regs in this model, so hasHazard should be false,
-                    // but we can still be safe and stall if somehow true.
-                    if (hasHazard) {
-                        next[ID_IDX] = cur;  // stay in ID until deps are clear
-                    } else {
-                        cpu.timelines[idx].cycle[ID_IDX] = cpu.cycle;  // retires in ID
-                        cpu.haltFetched = true;                        // stop fetching
-                        // Do NOT enqueue it into any next[] stage; it vanishes here.
+                    // SW NEVER misses → 0-cycle D-cache penalty
+                    if (inst.op == Opcode::SW) {
+                        cur.memCyclesRemaining = 0;
+                    }
+
+                    if (!stay && cur.memCyclesRemaining > 0) {
+                        cur.memCyclesRemaining--;
+                        if (cur.memCyclesRemaining > 0) stay = true;
+                    }
+
+                    if (stay) {
+                        next[MEM_IDX] = cur;
+                    }
+                    else {
+                        if (!next[WB_IDX].valid) {
+                            cpu.timelines[idx].cycle[MEM_IDX] = cpu.cycle;
+                            next[WB_IDX] = cur;
+                        } else {
+                            next[MEM_IDX] = cur;
+                        }
                     }
                 }
-                // -------- Special case: Branches (J, BEQ, BNE) --------
-                else if (inst.op == Opcode::J ||
-                         inst.op == Opcode::BEQ ||
-                         inst.op == Opcode::BNE) {
-                    // Branch should only resolve when its source registers are ready.
-                    if (hasHazard) {
-                        // Not all source regs are ready yet -> branch must wait in ID
-                        next[ID_IDX] = cur;
-                    } else {
-                        // Operands are ready -> resolve branch here in ID.
-                        cpu.timelines[idx].cycle[ID_IDX] = cpu.cycle;
-
-                        // TODO (later):
-                        //  - evaluate BEQ/BNE condition using cpu.regs[rs], cpu.regs[rt]
-                        //  - set pc = target if taken
-                        //  - flush IF latch on taken branch
-
-                        // For now we just retire the branch here and DO NOT send it to EX/MEM/WB.
-                        // So we leave next[ID_IDX] invalid.
-                    }
-                }
-                // -------- Normal instructions: go into EX1, using same hazard logic --------
                 else {
-                    int  nextStage  = EX1_IDX; // EX1
-                    bool targetFree = !next[nextStage].valid;
-                    bool dataReady  = !hasHazard;
-
-                    if (dataReady && targetFree) {
-                        // No hazard and EX1 free: move ID -> EX1
-                        cpu.timelines[idx].cycle[ID_IDX] = cpu.cycle;
-                        next[nextStage] = cur;
+                    // Non-load/store = 1-cycle MEM
+                    if (!next[WB_IDX].valid) {
+                        cpu.timelines[idx].cycle[MEM_IDX] = cpu.cycle;
+                        next[WB_IDX] = cur;
                     } else {
-                        // Stall in ID
-                        next[ID_IDX] = cur;
+                        next[MEM_IDX] = cur;
                     }
                 }
             }
         }
 
-        // -------------------------
-// 5) IF stage (I-cache access, 9 cycles, shared with D-cache)
-// -------------------------
-{
-    PipelineLatch &cur = cpu.stage[IF_IDX];
-    if (cur.valid) {
-        int idx       = cur.instrIndex;
-        int nextStage = ID_IDX;
+        // ---------------- EX1..EX5 ----------------
+        handleEXStages(cpu, next, EX1_IDX, EX5_IDX);
 
-        bool stayInIF = false;
-        bool isHit    = inICache(cpu, idx);
+        // ---------------- ID ----------------
+        handleIDStage(cpu, cpu.stage[ID_IDX], next, ID_IDX, EX1_IDX);
 
-        // If not in cache → MISS → must start or continue a cache fill
-        if (!isHit) {
-            // If not already filling (memCyclesRemaining == 0)
-            if (cur.memCyclesRemaining <= 0) {
-                // Try to start cache fill
-                if (cpu.cycle >= cpu.cacheBusyUntil) {
+        // ---------------- IF (I-cache access) ----------------
+        {
+            auto &cur = cpu.stage[IF_IDX];
+            if (cur.valid) {
+                int idx = cur.instrIndex;
+                bool stay = false;
 
-                    // Start fill
+                bool hit = inICache(cpu, idx);
+
+                // MISS → must start 12-cycle memory fill
+                if (!hit) {
+                    if (cur.memCyclesRemaining <= 0) {
+                        if (cpu.cycle >= cpu.cacheBusyUntil) {
+                            //cpu.iCache.accessCount++;
+
+                            cur.memCyclesRemaining = CACHE_LATENCY;
+                            cpu.cacheBusyUntil = cpu.cycle + CACHE_LATENCY;
+                        }
+                        else {
+                            stay = true;
+                        }
+                    }
+
+                    if (!stay && cur.memCyclesRemaining > 0) {
+                        cur.memCyclesRemaining--;
+                        if (cur.memCyclesRemaining > 0) stay = true;
+                        else {
+                            // fill ends → load block
+                            loadICacheBlock(cpu, idx);
+                        }
+                    }
+                }
+                else {
+                    cpu.iCache.hitCount++;
+                }
+
+                if (stay || next[ID_IDX].valid) {
+                    next[IF_IDX] = cur;
+                }
+                else {
+                    cpu.timelines[idx].cycle[IF_IDX] = cpu.cycle;
+                    cur.memCyclesRemaining = 0;
+                    next[ID_IDX] = cur;
                     cpu.iCache.accessCount++;
-                    cur.memCyclesRemaining = 9;  // CACHE_LATENCY
-                    cpu.cacheBusyUntil     = cpu.cycle + 9;
-
-                } else {
-                    // Cache port busy, must wait
-                    stayInIF = true;
-                }
-            }
-
-            // If fill is in progress
-            if (!stayInIF && cur.memCyclesRemaining > 0) {
-                cur.memCyclesRemaining--;
-                if (cur.memCyclesRemaining > 0) {
-                    stayInIF = true;   // still filling
-                } else {
-                    // Fill finished this cycle
-                    loadICacheBlock(cpu, idx);   // <-- Insert block of 4 instructions
                 }
             }
         }
 
-        // If miss OR ID is busy → stay in IF
-        if (stayInIF || next[nextStage].valid) {
-            next[IF_IDX] = cur;
-        }
-        else {
-            // Cache hit AND ID free → move forward
-            cpu.timelines[idx].cycle[IF_IDX] = cpu.cycle;
-            cur.memCyclesRemaining = 0;
-            next[nextStage] = cur;
-        }
-    }
-}
-        // -------------------------
-        // 6) Fetch new instruction into IF
-        // -------------------------
+        // ---------------- FETCH NEW INSTRUCTION ----------------
         if (!cpu.haltFetched) {
-            if (!next[IF_IDX].valid && pc < N) {
-                PipelineLatch latch;
-                latch.valid             = true;
-                latch.instrIndex        = pc;
-                latch.memCyclesRemaining = 0;
+            if (!next[IF_IDX].valid) {
 
-                next[IF_IDX] = latch;
-                pc++;
+                if (cpu.programCounterOverride >= 0) {
+                    pc = cpu.programCounterOverride;
+                    cpu.programCounterOverride = -1;
+                }
+
+                if (pc < N) {
+                    PipelineLatch L;
+                    L.valid = true;
+                    L.instrIndex = pc;
+                    next[IF_IDX] = L;
+                    pc++;
+                }
             }
         }
 
-        // commit next latches
-        for (int s = 0; s < STAGES; ++s) {
-            cpu.stage[s] = next[s];
-        }
+        // ---------------- COMMIT NEXT ----------------
+        for (int s = 0; s < STAGES; s++) cpu.stage[s] = next[s];
 
-        // stop when no more instructions to fetch AND pipeline drained
-        if (pc >= N && pipelineEmpty(cpu)) {
-            break;
-        }
+        // ---------------- STOP WHEN DONE ----------------
+        if (pc >= N && pipelineEmpty(cpu)) break;
     }
 
-    // ============================
-    // Write output file
-    // ============================
+    // =====================================================
+    // Write Output File (EXACT FORMAT YOU REQUESTED)
+    // =====================================================
     ofstream fout(outputFile);
     if (!fout) {
-        cerr << "Error: cannot open output file: " << outputFile << "\n";
-        exit(1);
+        cerr << "ERR: Cannot open output\n";
+        return;
     }
 
     fout << "Cycle Number for Each Stage"
@@ -555,16 +706,16 @@ void simulate(CPU &cpu, const string &outputFile) {
          << setw(8)  << "WB"
          << "\n";
 
-    for (size_t i = 0; i < cpu.program.size(); ++i) {
-        const Instruction         &inst = cpu.program[i];
-        const InstructionTimeline &tl   = cpu.timelines[i];
+    for (int i = 0; i < N; i++) {
+        const Instruction &inst = cpu.program[i];
+        const InstructionTimeline &tl = cpu.timelines[i];
 
-        fout << left  << setw(30) << inst.raw   // first column: instruction text
-             << right << setw(8)  << tl.cycle[IF_IDX]
-             << right << setw(8)  << tl.cycle[ID_IDX]
-             << right << setw(8)  << tl.cycle[EX5_IDX]
-             << right << setw(8)  << tl.cycle[MEM_IDX]
-             << right << setw(8)  << tl.cycle[WB_IDX]
+        fout << left << setw(30) << inst.raw
+             << right << setw(8) << ((tl.cycle[IF_IDX] - 1) != -1 ? std::to_string(tl.cycle[IF_IDX] - 1) : "")
+             << right << setw(8) << ((tl.cycle[ID_IDX] - 1) != -1 ? std::to_string(tl.cycle[ID_IDX] - 1) : "")
+             << right << setw(8) << ((tl.cycle[EX5_IDX] - 1) != -1 ? std::to_string(tl.cycle[EX5_IDX] - 1) : "")
+             << right << setw(8) << ((tl.cycle[MEM_IDX] - 1) != -1 ? std::to_string(tl.cycle[MEM_IDX] - 1) : "")
+             << right << setw(8) << ((tl.cycle[WB_IDX] - 1) != -1 ? std::to_string(tl.cycle[WB_IDX] - 1) : "")
              << "\n";
     }
 
@@ -576,44 +727,37 @@ void simulate(CPU &cpu, const string &outputFile) {
     fout << "Number of data cache hits: " << cpu.dCache.hitCount << "\n";
 }
 
-// ============================
-// main()
-// ============================
-int main(int argc, char *argv[]) {
+
+// ===============================================================
+//  FINAL main() — unchanged format
+// ===============================================================
+int main(int argc, char *argv[])
+{
     if (argc != 4) {
         cerr << "Usage: simulator inst.txt data.txt output.txt\n";
         return 1;
     }
 
-    string instFile   = argv[1];
-    string dataFile   = argv[2];
+    string instFile = argv[1];
+    string dataFile = argv[2];
     string outputFile = argv[3];
 
     CPU cpu;
 
-    // Parse instructions (fills program + label map)
+    // load program
     cpu.program = parseInstFile(instFile, cpu.labelToIndex);
 
-    // Parse data file into a temp vector
+    // load data
     auto dataVec = parseDataFile(dataFile);
+    cpu.memory.assign(2048, 0);
 
-    // Make memory big enough and load data at address 0x100
-    cpu.memory.assign(1024, 0);
-    const uint32_t DATA_BASE_ADDR = 0x100;
-
-    for (size_t i = 0; i < dataVec.size(); ++i) {
-        uint32_t addr = DATA_BASE_ADDR + static_cast<uint32_t>(i);
-        if (addr >= cpu.memory.size()) {
-            cerr << "Error: data segment overflow in memory\n";
-            return 1;
-        }
-        cpu.memory[addr] = dataVec[i];
+    const uint32_t BASE = 0x100;
+    for (size_t i = 0; i < dataVec.size(); i++) {
+        cpu.memory[BASE + i] = dataVec[i];
     }
 
-    // Prepare timelines (one per instruction)
     cpu.timelines.resize(cpu.program.size());
 
-    // Run pipeline with dummy MEM stalls
     simulate(cpu, outputFile);
 
     return 0;
